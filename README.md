@@ -27,6 +27,8 @@ mcp (lecture seule, HTTP + jeton) ◄── Claude Code
 
 **Arrêt à la voix** : n'importe quel participant peut dire la phrase définie dans `STOP_PHRASE` (par défaut « merci Claude pour les travaux ») pour arrêter le meet, comme avec `/meet stop`. Pendant le meet, le transcripteur écoute chaque prise de parole de moins de 15 s avec un petit modèle rapide (`WHISPER_STOP_MODEL`) ; la phrase doit finir la prise de parole (quelques mots après sont tolérés), pour qu'en parler au milieu d'une explication ne coupe rien. Compter 3 à 5 s entre la phrase et l'arrêt. `STOP_PHRASE` vide désactive la fonction.
 
+**Démarrage automatique** : pour les salons listés dans `AUTO_JOIN_CHANNELS` (ex. le salon du daily), le bot entre et lance l'enregistrement dès qu'une personne y arrive, puis s'arrête quand tout le monde est parti. Après un `/meet stop` ou la phrase d'arrêt, il ne revient pas tant que le salon ne s'est pas vidé.
+
 Le bot s'arrête aussi tout seul quand il reste seul dans le salon (`AUTO_STOP_EMPTY_SECONDS`) ou après `MAX_MEETING_MINUTES`.
 
 Le message de début d'enregistrement sert à informer tout le monde : préviens aussi les invités qui arrivent en cours de meet.

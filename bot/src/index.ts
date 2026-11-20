@@ -27,8 +27,24 @@ const AUTO_STOP_EMPTY_MS = Number(process.env.AUTO_STOP_EMPTY_SECONDS ?? 60) * 1
 const MAX_MEETING_MS = Number(process.env.MAX_MEETING_MINUTES ?? 180) * 60_000;
 /** Phrase qui arrête le meet à la voix (détectée par le transcripteur). Vide : désactivé. */
 const STOP_PHRASE = (process.env.STOP_PHRASE ?? '').trim();
+/**
+ * Salons vocaux (identifiants ou noms exacts, séparés par des virgules) que le bot rejoint
+ * tout seul dès qu'une personne y entre. Il en repart quand le salon reste vide.
+ */
+const AUTO_JOIN_CHANNELS = (process.env.AUTO_JOIN_CHANNELS ?? '')
+  .split(',')
+  .map((c) => c.trim())
+  .filter(Boolean);
 
 const store = new MeetingStore(DATA_DIR);
+
+/** Serveurs où un démarrage est en cours (évite deux meets si deux personnes arrivent ensemble). */
+const starting = new Set<string>();
+/**
+ * Salons auto où le meet a été arrêté à la main (/meet stop, phrase d'arrêt) alors que des
+ * personnes y étaient encore : on ne relance pas avant que le salon se soit vidé.
+ */
+const autoJoinPaused = new Set<string>();
 
 interface ActiveMeeting {
   meeting: Meeting;
@@ -61,7 +77,43 @@ client.once(Events.ClientReady, async (c) => {
   for (const guild of c.guilds.cache.values()) await registerCommands(guild);
   setInterval(() => notifyFinishedTranscriptions().catch((e) => console.error('[notify]', e)), 15_000);
   if (STOP_PHRASE) setInterval(() => void checkVoiceStops(), 1_000);
+  if (AUTO_JOIN_CHANNELS.length > 0) {
+    console.log(`[bot] rejoint automatiquement : ${AUTO_JOIN_CHANNELS.join(', ')}`);
+    // Bot redémarré pendant un meet : des personnes sont peut-être déjà dans le salon.
+    for (const guild of c.guilds.cache.values()) {
+      for (const channel of guild.channels.cache.values()) {
+        if (channel.isVoiceBased() && isAutoJoinChannel(channel)) void autoJoin(channel);
+      }
+    }
+  }
 });
+
+function isAutoJoinChannel(channel: VoiceBasedChannel): boolean {
+  return AUTO_JOIN_CHANNELS.includes(channel.id) || AUTO_JOIN_CHANNELS.includes(channel.name);
+}
+
+function humansIn(channel: VoiceBasedChannel): number {
+  return channel.members.filter((m) => !m.user.bot).size;
+}
+
+/** Démarre un meet dans un salon auto s'il y a quelqu'un et qu'aucun meet ne tourne sur le serveur. */
+async function autoJoin(channel: VoiceBasedChannel): Promise<void> {
+  const guildId = channel.guild.id;
+  if (humansIn(channel) === 0 || active.has(guildId) || starting.has(guildId) || autoJoinPaused.has(channel.id)) {
+    return;
+  }
+  try {
+    await startMeeting(channel, {
+      title: `Meet ${channel.name}`,
+      startedBy: { id: client.user!.id, name: 'démarrage automatique' },
+      // Le salon vocal a son propre chat : c'est là que tout le monde voit l'annonce.
+      textChannelId: channel.id,
+    });
+    await sendToTextChannel(active.get(guildId)!.meeting, startedMessage(active.get(guildId)!.meeting));
+  } catch (err) {
+    console.error(`[bot] démarrage automatique dans #${channel.name} :`, err);
+  }
+}
 
 let checkingVoiceStops = false;
 
@@ -101,6 +153,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  if (AUTO_JOIN_CHANNELS.length > 0) {
+    // Salon auto vidé : la pause posée par un arrêt manuel est levée.
+    const left = oldState.channel;
+    if (left && left.id !== newState.channelId && autoJoinPaused.has(left.id) && humansIn(left) === 0) {
+      autoJoinPaused.delete(left.id);
+    }
+    // Quelqu'un vient d'entrer dans un salon auto (les changements de micro ou de caméra ne comptent pas).
+    const joined = newState.channel;
+    if (joined && oldState.channelId !== joined.id && !newState.member?.user.bot && isAutoJoinChannel(joined)) {
+      void autoJoin(joined);
+    }
+  }
+
   const current = active.get(newState.guild.id);
   if (!current) return;
   const channelId = current.meeting.channelId;
@@ -137,18 +202,56 @@ async function handleStart(interaction: ChatInputCommandInteraction<'cached'>): 
     });
     return;
   }
+  if (starting.has(interaction.guildId)) {
+    await interaction.reply({ content: 'Un meet est en train de démarrer.', flags: MessageFlags.Ephemeral });
+    return;
+  }
   await interaction.deferReply();
+  const meeting = await startMeeting(voice, {
+    title: interaction.options.getString('titre') ?? `Meet ${voice.name}`,
+    startedBy: { id: member.id, name: member.displayName },
+    textChannelId: interaction.channelId,
+  });
+  await interaction.editReply(startedMessage(meeting));
+}
 
+function startedMessage(meeting: Meeting): string {
+  return (
+    `🔴 **Enregistrement en cours** dans <#${meeting.channelId}> : tout ce qui est dit sera transcrit ` +
+    `(démarré par ${meeting.startedBy.name}). \`/meet stop\` pour arrêter` +
+    (STOP_PHRASE ? `, ou dites « ${STOP_PHRASE} »` : '') +
+    `.\n-# Meet \`${meeting.id}\``
+  );
+}
+
+/** Rejoint le salon vocal et commence l'enregistrement. */
+async function startMeeting(
+  voice: VoiceBasedChannel,
+  opts: { title: string; startedBy: Meeting['startedBy']; textChannelId: string },
+): Promise<Meeting> {
+  const guildId = voice.guild.id;
+  starting.add(guildId);
+  try {
+    return await doStartMeeting(voice, opts);
+  } finally {
+    starting.delete(guildId);
+  }
+}
+
+async function doStartMeeting(
+  voice: VoiceBasedChannel,
+  opts: { title: string; startedBy: Meeting['startedBy']; textChannelId: string },
+): Promise<Meeting> {
   const startedAt = new Date();
   const meeting: Meeting = {
     id: meetingId(startedAt, voice.name),
-    title: interaction.options.getString('titre') ?? `Meet ${voice.name}`,
-    guildId: interaction.guildId,
-    guildName: interaction.guild.name,
+    title: opts.title,
+    guildId: voice.guild.id,
+    guildName: voice.guild.name,
     channelId: voice.id,
     channelName: voice.name,
-    textChannelId: interaction.channelId,
-    startedBy: { id: member.id, name: member.displayName },
+    textChannelId: opts.textChannelId,
+    startedBy: opts.startedBy,
     startedAt: startedAt.toISOString(),
     endedAt: null,
     status: 'recording',
@@ -163,7 +266,7 @@ async function handleStart(interaction: ChatInputCommandInteraction<'cached'>): 
     connection.destroy();
     throw err;
   }
-  const recorder = new MeetingRecorder(connection, meeting, store, (userId) => speakerName(interaction.guild, userId));
+  const recorder = new MeetingRecorder(connection, meeting, store, (userId) => speakerName(voice.guild, userId));
   recorder.start();
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -178,21 +281,21 @@ async function handleStart(interaction: ChatInputCommandInteraction<'cached'>): 
     }
   });
 
-  active.set(meeting.guildId, {
+  const current: ActiveMeeting = {
     meeting,
     connection,
     recorder,
     emptyTimer: null,
     maxTimer: setTimeout(() => void finishMeeting(meeting.guildId, 'durée maximale atteinte'), MAX_MEETING_MS),
-  });
+  };
+  active.set(meeting.guildId, current);
+  // Tout le monde est reparti pendant la connexion : le compte à rebours du salon vide démarre.
+  if (humansIn(voice) === 0) {
+    current.emptyTimer = setTimeout(() => void finishMeeting(meeting.guildId, 'salon vide'), AUTO_STOP_EMPTY_MS);
+  }
 
-  console.log(`[bot] meet ${meeting.id} démarré dans #${voice.name}`);
-  await interaction.editReply(
-    `🔴 **Enregistrement en cours** dans <#${voice.id}> : tout ce qui est dit sera transcrit ` +
-      `(démarré par ${member.displayName}). \`/meet stop\` pour arrêter` +
-      (STOP_PHRASE ? `, ou dites « ${STOP_PHRASE} »` : '') +
-      `.\n-# Meet \`${meeting.id}\``,
-  );
+  console.log(`[bot] meet ${meeting.id} démarré dans #${voice.name} par ${meeting.startedBy.name}`);
+  return meeting;
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction<'cached'>): Promise<void> {
@@ -246,6 +349,12 @@ async function finishMeeting(guildId: string, reason: string, announce = true): 
   current.connection.destroy();
 
   const { meeting } = current;
+  // Arrêté alors que des personnes sont encore là (/meet stop, phrase d'arrêt, durée max,
+  // bot sorti du salon) : pas de relance automatique avant que le salon se vide.
+  const channel = client.channels.cache.get(meeting.channelId);
+  if (channel?.isVoiceBased() && isAutoJoinChannel(channel) && humansIn(channel) > 0) {
+    autoJoinPaused.add(channel.id);
+  }
   meeting.endedAt = new Date().toISOString();
   meeting.status = current.recorder.segments > 0 ? 'recorded' : 'failed';
   if (meeting.status === 'failed') meeting.error = 'aucune prise de parole enregistrée';

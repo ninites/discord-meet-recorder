@@ -8,6 +8,7 @@ services:
       AUTO_STOP_EMPTY_SECONDS: ${AUTO_STOP_EMPTY_SECONDS:-60}
       MAX_MEETING_MINUTES: ${MAX_MEETING_MINUTES:-180}
       STOP_PHRASE: ${STOP_PHRASE:-}
+      AUTO_JOIN_CHANNELS: ${AUTO_JOIN_CHANNELS:-}
     volumes:
       - meetings:/data
     # Laisse le temps d'écrire les dernières prises de parole à l'arrêt.

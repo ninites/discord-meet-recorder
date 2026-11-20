@@ -1,8 +1,10 @@
 """Transcrit les meets Discord enregistrés par le bot, avec faster-whisper en local.
 
-Surveille <DATA_DIR>/meetings/*/meeting.json. Un meet au statut « recorded » est transcrit
-prise de parole par prise de parole (chaque WAV n'a qu'une personne), puis passe en
-« transcribed » avec un transcript.json. L'audio est supprimé ensuite, sauf KEEP_AUDIO=true.
+Surveille <DATA_DIR>/meetings/*/meeting.json. Chaque prise de parole (un WAV, une seule personne)
+est transcrite dès que le bot l'a écrite, pendant le meet, et le résultat est gardé dans
+partial.jsonl. Quand le meet passe en « recorded », il ne reste que les dernières prises de parole
+à transcrire : le transcript.json est écrit et le meet passe en « transcribed ». L'audio est
+supprimé ensuite, sauf KEEP_AUDIO=true.
 
 Si STOP_PHRASE est défini, un second fil surveille les meets en cours et demande l'arrêt au bot
 quand quelqu'un dit cette phrase (voir watch_stop_phrase).
@@ -31,6 +33,12 @@ CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0"))
 INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT") or None
 KEEP_AUDIO = os.environ.get("KEEP_AUDIO", "false").lower() == "true"
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "10"))
+# Pendant un meet, intervalle de relecture des nouvelles prises de parole.
+LIVE_POLL_SECONDS = float(os.environ.get("LIVE_POLL_SECONDS", "2"))
+# Prises de parole d'un meet en cours traitées d'affilée, pour qu'un meet terminé n'attende pas.
+LIVE_BATCH = 10
+# Transcriptions déjà faites pendant le meet : une ligne {"file", "entries"} par prise de parole.
+PARTIAL = "partial.jsonl"
 # Phrase qui arrête le meet quand quelqu'un la dit. Vide : arrêt à la voix désactivé.
 STOP_PHRASE = os.environ.get("STOP_PHRASE", "").strip()
 # Modèle rapide utilisé pendant le meet, seulement pour repérer la phrase d'arrêt.
@@ -63,44 +71,83 @@ def read_segments(meeting_dir: Path) -> list[dict]:
     path = meeting_dir / "segments.jsonl"
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return sorted((json.loads(line) for line in lines if line.strip()), key=lambda s: s["offsetMs"])
+    return sorted(read_jsonl(path), key=lambda s: s["offsetMs"])
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """Lignes JSON d'un fichier en cours d'écriture : une ligne incomplète est ignorée (relue au tour suivant)."""
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def transcribe_segment(model, meeting_dir: Path, seg: dict) -> list[dict]:
+    audio = meeting_dir / seg["file"]
+    if not audio.exists():
+        log.warning("%s : audio manquant %s", meeting_dir.name, seg["file"])
+        return []
+    pieces, _info = model.transcribe(
+        str(audio),
+        language=LANGUAGE,
+        beam_size=5,
+        vad_filter=True,
+        # Chaque fichier est court et ne contient qu'une personne : pas de contexte à reporter,
+        # ce qui évite les répétitions en boucle de Whisper.
+        condition_on_previous_text=False,
+        initial_prompt=INITIAL_PROMPT,
+    )
+    entries = []
+    for piece in pieces:
+        text = piece.text.strip()
+        if not text:
+            continue
+        entries.append(
+            {
+                "speaker": seg["speaker"],
+                "userId": seg["userId"],
+                "startMs": seg["offsetMs"] + round(piece.start * 1000),
+                "endMs": seg["offsetMs"] + round(piece.end * 1000),
+                "text": text,
+            }
+        )
+    return entries
+
+
+def load_partial(meeting_dir: Path) -> dict[str, list[dict]]:
+    path = meeting_dir / PARTIAL
+    if not path.exists():
+        return {}
+    return {row["file"]: row["entries"] for row in read_jsonl(path)}
+
+
+def transcribe_new_segments(model, meeting_dir: Path, limit: int | None = None, skip: set[str] = frozenset()) -> int:
+    """Transcrit les prises de parole pas encore faites (au plus `limit`) et les ajoute à partial.jsonl.
+    Renvoie le nombre de prises de parole traitées."""
+    done = load_partial(meeting_dir)
+    todo = [s for s in read_segments(meeting_dir) if s["file"] not in done and s["file"] not in skip]
+    if limit is not None:
+        todo = todo[:limit]
+    for i, seg in enumerate(todo, 1):
+        entries = transcribe_segment(model, meeting_dir, seg)
+        with (meeting_dir / PARTIAL).open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"file": seg["file"], "entries": entries}, ensure_ascii=False) + "\n")
+        if limit is None and i % 20 == 0:
+            log.info("%s : %d/%d prises de parole restantes", meeting_dir.name, i, len(todo))
+    return len(todo)
 
 
 def transcribe_meeting(model, meeting_dir: Path) -> int:
+    remaining = transcribe_new_segments(model, meeting_dir)
+    log.info("%s : %d prises de parole transcrites après l'arrêt", meeting_dir.name, remaining)
     segments = read_segments(meeting_dir)
-    entries: list[dict] = []
-    for i, seg in enumerate(segments, 1):
-        audio = meeting_dir / seg["file"]
-        if not audio.exists():
-            log.warning("%s : audio manquant %s", meeting_dir.name, seg["file"])
-            continue
-        pieces, _info = model.transcribe(
-            str(audio),
-            language=LANGUAGE,
-            beam_size=5,
-            vad_filter=True,
-            # Chaque fichier est court et ne contient qu'une personne : pas de contexte à reporter,
-            # ce qui évite les répétitions en boucle de Whisper.
-            condition_on_previous_text=False,
-            initial_prompt=INITIAL_PROMPT,
-        )
-        for piece in pieces:
-            text = piece.text.strip()
-            if not text:
-                continue
-            entries.append(
-                {
-                    "speaker": seg["speaker"],
-                    "userId": seg["userId"],
-                    "startMs": seg["offsetMs"] + round(piece.start * 1000),
-                    "endMs": seg["offsetMs"] + round(piece.end * 1000),
-                    "text": text,
-                }
-            )
-        if i % 20 == 0:
-            log.info("%s : %d/%d prises de parole", meeting_dir.name, i, len(segments))
-
+    done = load_partial(meeting_dir)
+    entries = [e for seg in segments for e in done.get(seg["file"], [])]
     entries.sort(key=lambda e: e["startMs"])
     write_json(
         meeting_dir / "transcript.json",
@@ -112,23 +159,52 @@ def transcribe_meeting(model, meeting_dir: Path) -> int:
             "entries": entries,
         },
     )
+    (meeting_dir / PARTIAL).unlink(missing_ok=True)
     if not KEEP_AUDIO:
         for seg in segments:
             (meeting_dir / seg["file"]).unlink(missing_ok=True)
     return len(entries)
 
 
-def pending_meetings() -> list[Path]:
+def meetings_with_status(status: str) -> list[Path]:
     if not MEETINGS.exists():
         return []
     found = []
     for meeting_json in MEETINGS.glob("*/meeting.json"):
         try:
-            if read_json(meeting_json).get("status") == "recorded":
+            if read_json(meeting_json).get("status") == status:
                 found.append(meeting_json.parent)
         except (OSError, json.JSONDecodeError):
             continue
     return sorted(found)
+
+
+def pending_meetings() -> list[Path]:
+    return meetings_with_status("recorded")
+
+
+# Prises de parole illisibles pendant le meet : pas retentées en direct, la passe finale s'en charge.
+live_failures: dict[str, set[str]] = {}
+
+
+def transcribe_live(model) -> tuple[bool, bool]:
+    """Avance la transcription des meets en cours. Renvoie (meet en cours ?, travail fait ?)."""
+    recording = meetings_with_status("recording")
+    worked = False
+    for meeting_dir in recording:
+        skip = live_failures.setdefault(meeting_dir.name, set())
+        try:
+            worked |= transcribe_new_segments(model, meeting_dir, limit=LIVE_BATCH, skip=skip) > 0
+        except Exception:  # noqa: BLE001 — une prise de parole illisible ne doit pas bloquer le meet
+            log.exception("%s : transcription en direct", meeting_dir.name)
+            done = load_partial(meeting_dir)
+            for seg in read_segments(meeting_dir):
+                if seg["file"] not in done and seg["file"] not in skip:
+                    skip.add(seg["file"])
+                    break
+    for meeting_id in set(live_failures) - {d.name for d in recording}:
+        del live_failures[meeting_id]
+    return bool(recording), worked
 
 
 def recover_interrupted() -> None:
@@ -227,7 +303,9 @@ def main() -> None:
             except Exception as err:  # noqa: BLE001 — un meet en échec ne doit pas bloquer les suivants
                 log.exception("%s : échec", meeting_dir.name)
                 set_status(meeting_dir, "failed", error=f"transcription : {err}")
-        time.sleep(POLL_SECONDS)
+        recording, worked = transcribe_live(model)
+        if not worked:
+            time.sleep(LIVE_POLL_SECONDS if recording else POLL_SECONDS)
 
 
 if __name__ == "__main__":

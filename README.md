@@ -49,7 +49,7 @@ docker compose logs -f
 
 Au premier démarrage, le transcripteur télécharge le modèle Whisper (environ 1,5 Go pour `medium`), qui est gardé dans le volume `whisper-models`.
 
-Ordre de grandeur sans GPU avec `medium` en `int8` : la transcription prend entre un tiers et la totalité de la durée de parole, selon le CPU. Si c'est trop lent sur le LXC, passe à `WHISPER_MODEL=small`.
+La transcription se fait au fil du meet : chaque prise de parole est transcrite dès qu'elle est finie, et à l'arrêt il ne reste que les dernières, donc la transcription est prête environ une minute après. Ordre de grandeur sans GPU avec `medium` en `int8` : transcrire prend entre un tiers et la totalité de la durée de parole, selon le CPU ; si le CPU ne suit pas pendant un meet très bavard, le retard est rattrapé à l'arrêt. Si c'est trop lent sur le LXC, passe à `WHISPER_MODEL=small`.
 
 ### 3. Brancher Claude Code
 
@@ -78,6 +78,6 @@ cd mcp && npm ci && npm run build && npm test
 cd transcriber && python3 -m unittest test_stop_phrase   # reconnaissance de la phrase d'arrêt
 ```
 
-Fichiers d'un meet (`/data/meetings/<id>/`) : `meeting.json` (statut `recording` → `recorded` → `transcribing` → `transcribed` ou `failed`), `segments.jsonl`, `segments/*.wav`, `transcript.json`, `.notified`.
+Fichiers d'un meet (`/data/meetings/<id>/`) : `meeting.json` (statut `recording` → `recorded` → `transcribing` → `transcribed` ou `failed`), `segments.jsonl`, `segments/*.wav`, `partial.jsonl` (transcription faite pendant le meet), `transcript.json`, `.notified`.
 
-Si le bot redémarre pendant un meet, ce qui a déjà été enregistré est transcrit. Si le transcripteur redémarre pendant une transcription, il la reprend.
+Si le bot redémarre pendant un meet, ce qui a déjà été enregistré est transcrit. Si le transcripteur redémarre pendant une transcription, il la reprend là où il en était.

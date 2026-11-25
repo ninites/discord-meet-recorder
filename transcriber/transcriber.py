@@ -6,7 +6,8 @@ partial.jsonl. Quand le meet passe en « recorded », il ne reste que les derni�
 à transcrire : le transcript.json est écrit et le meet passe en « transcribed ». L'audio est
 supprimé ensuite, sauf KEEP_AUDIO=true.
 
-Si STOP_PHRASE est défini, un second fil surveille les meets en cours et demande l'arrêt au bot
+Si STOP_PHRASE est défini (une ou plusieurs phrases séparées par « | »), un second fil surveille
+les meets en cours et demande l'arrêt au bot
 quand quelqu'un dit cette phrase (voir watch_stop_phrase).
 """
 
@@ -21,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hallucinations import is_hallucination
-from stop_phrase import ends_with_stop_phrase
+from stop_phrase import matching_stop_phrase, parse_stop_phrases
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MEETINGS = DATA_DIR / "meetings"
@@ -41,7 +42,7 @@ LIVE_BATCH = 10
 # Transcriptions déjà faites pendant le meet : une ligne {"file", "entries"} par prise de parole.
 PARTIAL = "partial.jsonl"
 # Phrase qui arrête le meet quand quelqu'un la dit. Vide : arrêt à la voix désactivé.
-STOP_PHRASE = os.environ.get("STOP_PHRASE", "").strip()
+STOP_PHRASES = parse_stop_phrases(os.environ.get("STOP_PHRASE"))
 # Modèle rapide utilisé pendant le meet, seulement pour repérer la phrase d'arrêt.
 STOP_MODEL = os.environ.get("WHISPER_STOP_MODEL", "small")
 # Au-delà, une prise de parole est trop longue pour être juste la phrase d'arrêt : on ne la transcrit pas en direct.
@@ -236,9 +237,9 @@ def load_model(name: str = MODEL):
 
 def watch_stop_phrase() -> None:
     """Pendant les meets en cours, transcrit chaque prise de parole courte dès qu'elle est écrite
-    et dépose stop-request.json si elle se termine par STOP_PHRASE. Le bot surveille ce fichier."""
+    et dépose stop-request.json si elle se termine par l'une des STOP_PHRASES. Le bot surveille ce fichier."""
     model = load_model(STOP_MODEL)
-    log.info("arrêt à la voix actif : « %s »", STOP_PHRASE)
+    log.info("arrêt à la voix actif : %s", " / ".join(f"« {p} »" for p in STOP_PHRASES))
     seen: dict[str, set[str]] = {}
     while True:
         recording = set()
@@ -266,15 +267,18 @@ def watch_stop_phrase() -> None:
                         beam_size=1,
                         vad_filter=True,
                         condition_on_previous_text=False,
-                        # Oriente Whisper vers la bonne orthographe de la phrase.
-                        initial_prompt=STOP_PHRASE,
+                        # Oriente Whisper vers la bonne orthographe des phrases.
+                        initial_prompt=". ".join(STOP_PHRASES),
                     )
                     text = " ".join(p.text.strip() for p in pieces)
                 except Exception:  # noqa: BLE001 — un fichier illisible ne doit pas arrêter la surveillance
                     log.exception("%s : lecture de %s", meeting_dir.name, seg["file"])
                     continue
-                if ends_with_stop_phrase(text, STOP_PHRASE):
-                    log.info("%s : phrase d'arrêt dite par %s (« %s »)", meeting_dir.name, seg["speaker"], text)
+                phrase = matching_stop_phrase(text, STOP_PHRASES)
+                if phrase:
+                    log.info(
+                        "%s : phrase d'arrêt « %s » dite par %s (« %s »)", meeting_dir.name, phrase, seg["speaker"], text
+                    )
                     write_json(
                         meeting_dir / "stop-request.json",
                         {
@@ -294,7 +298,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     MEETINGS.mkdir(parents=True, exist_ok=True)
     recover_interrupted()
-    if STOP_PHRASE:
+    if STOP_PHRASES:
         threading.Thread(target=watch_stop_phrase, name="stop-phrase", daemon=True).start()
     model = load_model()
     log.info("prêt, surveille %s", MEETINGS)

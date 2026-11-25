@@ -1,4 +1,7 @@
-"""Reconnaît la phrase d'arrêt (STOP_PHRASE) à la fin d'une prise de parole transcrite."""
+"""Reconnaît une phrase d'arrêt (STOP_PHRASE) à la fin d'une prise de parole transcrite.
+
+STOP_PHRASE peut contenir plusieurs phrases séparées par « | » : n'importe laquelle arrête le meet.
+"""
 
 from __future__ import annotations
 
@@ -33,3 +36,16 @@ def ends_with_stop_phrase(text: str, phrase: str) -> bool:
             if SequenceMatcher(None, window, goal).ratio() >= SIMILARITY:
                 return True
     return False
+
+
+def parse_stop_phrases(value: str | None) -> list[str]:
+    """« merci Claude pour les travaux | Claude, coupe l'enregistrement » → les phrases, sans les vides."""
+    return [p.strip() for p in (value or "").split("|") if p.strip()]
+
+
+def matching_stop_phrase(text: str, phrases: list[str]) -> str | None:
+    """La première phrase d'arrêt par laquelle se termine la prise de parole, sinon None."""
+    for phrase in phrases:
+        if ends_with_stop_phrase(text, phrase):
+            return phrase
+    return None

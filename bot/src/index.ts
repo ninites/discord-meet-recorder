@@ -25,8 +25,11 @@ const DATA_DIR = process.env.DATA_DIR ?? '/data';
 const AUTO_STOP_EMPTY_MS = Number(process.env.AUTO_STOP_EMPTY_SECONDS ?? 60) * 1000;
 /** Garde-fou : un meet oublié s'arrête tout seul. */
 const MAX_MEETING_MS = Number(process.env.MAX_MEETING_MINUTES ?? 180) * 60_000;
-/** Phrase qui arrête le meet à la voix (détectée par le transcripteur). Vide : désactivé. */
-const STOP_PHRASE = (process.env.STOP_PHRASE ?? '').trim();
+/** Phrases qui arrêtent le meet à la voix (détectées par le transcripteur), séparées par « | ». Vide : désactivé. */
+const STOP_PHRASES = (process.env.STOP_PHRASE ?? '')
+  .split('|')
+  .map((p) => p.trim())
+  .filter(Boolean);
 /**
  * Salons vocaux (identifiants ou noms exacts, séparés par des virgules) que le bot rejoint
  * tout seul dès qu'une personne y entre. Il en repart quand le salon reste vide.
@@ -76,7 +79,7 @@ client.once(Events.ClientReady, async (c) => {
   await recoverInterruptedMeetings();
   for (const guild of c.guilds.cache.values()) await registerCommands(guild);
   setInterval(() => notifyFinishedTranscriptions().catch((e) => console.error('[notify]', e)), 15_000);
-  if (STOP_PHRASE) setInterval(() => void checkVoiceStops(), 1_000);
+  if (STOP_PHRASES.length > 0) setInterval(() => void checkVoiceStops(), 1_000);
   if (AUTO_JOIN_CHANNELS.length > 0) {
     console.log(`[bot] rejoint automatiquement : ${AUTO_JOIN_CHANNELS.join(', ')}`);
     // Bot redémarré pendant un meet : des personnes sont peut-être déjà dans le salon.
@@ -219,7 +222,7 @@ function startedMessage(meeting: Meeting): string {
   return (
     `🔴 **Enregistrement en cours** dans <#${meeting.channelId}> : tout ce qui est dit sera transcrit ` +
     `(démarré par ${meeting.startedBy.name}). \`/meet stop\` pour arrêter` +
-    (STOP_PHRASE ? `, ou dites « ${STOP_PHRASE} »` : '') +
+    (STOP_PHRASES.length > 0 ? `, ou dites ${STOP_PHRASES.map((p) => `« ${p} »`).join(' ou ')}` : '') +
     `.\n-# Meet \`${meeting.id}\``
   );
 }
